@@ -11,4 +11,4 @@ extern void *mmapalloc(size_t size_alloc);
 extern void mmapfree(void *ptr);
 extern int mmapalloc_destroy();
 
-#endif GAMEEE_MMAPALLOC_H
+#endif

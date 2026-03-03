@@ -9,15 +9,31 @@
 
 #include <stdio.h>
 #include <stdint.h>
-#include <unistd.h>
 #include <string.h>
-#include <ctype.h>
 #include <stddef.h>
-#include <sys/mman.h>
-#include <pthread.h>
-#include <errno.h>
-#include <stdalign.h>
 #include <stdlib.h>
+#include <stdalign.h>
+#include <errno.h>
+
+#ifdef _WIN32
+  #define PLATFORM_WINDOWS
+  #include <windows.h>
+  #define MUTEX_T             CRITICAL_SECTION
+  #define MUTEX_INIT(m)       InitializeCriticalSection(&(m))
+  #define MUTEX_LOCK(m)       EnterCriticalSection(&(m))
+  #define MUTEX_UNLOCK(m)     LeaveCriticalSection(&(m))
+  #define MUTEX_DESTROY(m)    DeleteCriticalSection(&(m))
+#else
+  #define PLATFORM_POSIX
+  #include <unistd.h>
+  #include <sys/mman.h>
+  #include <pthread.h>
+  #define MUTEX_T             pthread_mutex_t
+  #define MUTEX_INIT(m)       pthread_mutex_init(&(m), NULL)
+  #define MUTEX_LOCK(m)       pthread_mutex_lock(&(m))
+  #define MUTEX_UNLOCK(m)     pthread_mutex_unlock(&(m))
+  #define MUTEX_DESTROY(m)    pthread_mutex_destroy(&(m))
+#endif
 
 #define MMAPALLOC "mmapalloc: "
 #define ARENA_CONTEXT_DEFAULT_INIT_SIZE (1024 * 32)
@@ -62,19 +78,47 @@ struct ArenaContext
 /* static block */
 struct ArenaContext *global_head_arena = NULL,*global_tail_arena = NULL;
 
-pthread_mutex_t mmapalloc_mutex_guard = PTHREAD_MUTEX_INITIALIZER;
+MUTEX_T mmapalloc_mutex_guard;
+int mmapalloc_mutex_initialized = 0;
+
+static void *os_alloc(size_t size)
+{
+#ifdef PLATFORM_WINDOWS
+    void *ptr = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!ptr) {
+        fprintf(stderr, MMAPALLOC "VirtualAlloc failed, error: %lu\n", GetLastError());
+        return NULL;
+    }
+    return ptr;
+#else
+    void *ptr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        fprintf(stderr, MMAPALLOC "mmap failed: %s\n", strerror(errno));
+        return NULL;
+    }
+    return ptr;
+#endif
+}
+
+static int os_free(void *ptr, size_t size)
+{
+#ifdef PLATFORM_WINDOWS
+    if (!VirtualFree(ptr, 0, MEM_RELEASE)) {
+        fprintf(stderr, MMAPALLOC "VirtualFree failed, error: %lu\n", GetLastError());
+        return -1;
+    }
+    return 0;
+#else
+    return munmap(ptr, size);
+#endif
+}
 
 static void *arena_init_context()
 {
-    void *new_mmap_arena_memory = (void *)mmap(NULL,sizeof(struct ArenaContext) + ARENA_CONTEXT_DEFAULT_INIT_SIZE,
-        PROT_READ | PROT_WRITE,MAP_PRIVATE | MAP_ANONYMOUS,-1,0
-        );
-    if (new_mmap_arena_memory == MAP_FAILED)
-    {
-        fprintf(stderr,MMAPALLOC "mmap failed %s\n",strerror(errno));
-        return NULL;
-    }
-    struct ArenaContext *arena_ctx = (struct ArenaContext *)new_mmap_arena_memory;
+    size_t total = sizeof(struct ArenaContext) + ARENA_CONTEXT_DEFAULT_INIT_SIZE;
+    struct ArenaContext *arena_ctx = (struct ArenaContext *)os_alloc(total);
+    if (!arena_ctx) return NULL;
 
     arena_ctx->size_arena = ARENA_CONTEXT_DEFAULT_INIT_SIZE;
     arena_ctx->offset_arena = ALIGN_UP(sizeof(struct ArenaContext));
@@ -144,14 +188,19 @@ static inline void coalesing_chunk()
 void *mmapalloc(size_t size)
 {
     size = ALIGN_UP(size);
-    pthread_mutex_lock(&mmapalloc_mutex_guard);
+    if (!mmapalloc_mutex_initialized) {
+        MUTEX_INIT(mmapalloc_mutex_guard);
+        mmapalloc_mutex_initialized = 1;
+    }
+    MUTEX_LOCK(mmapalloc_mutex_guard);
+
     if (!global_head_arena)
     {
         global_head_arena = arena_init_context();
         if (!global_head_arena)
         {
             fprintf(stderr,MMAPALLOC "failed to initialized arena context\n");
-            pthread_mutex_unlock(&mmapalloc_mutex_guard);
+            MUTEX_UNLOCK(mmapalloc_mutex_guard);
             return NULL;
         }
     }
@@ -163,7 +212,7 @@ void *mmapalloc(size_t size)
     {
         chunk_ctx_current->stub.is_free_chunk = CHUNK_CONTEXT_USED;
         global_head_arena->block_active_arena++;
-        pthread_mutex_unlock(&mmapalloc_mutex_guard);
+        MUTEX_UNLOCK(mmapalloc_mutex_guard);
         return (void *)((uintptr_t)chunk_ctx_current + sizeof(union ChunkContext));
     }
 
@@ -172,7 +221,7 @@ void *mmapalloc(size_t size)
     if (!new_memory_reserve)
     {
         fprintf(stderr,MMAPALLOC "failed to allocated new memory for chunk\n");
-        pthread_mutex_unlock(&mmapalloc_mutex_guard);
+        MUTEX_UNLOCK(mmapalloc_mutex_guard);
         return NULL;
     }
 
@@ -193,7 +242,7 @@ void *mmapalloc(size_t size)
         arena_ctx_current->tail_list_chunk = new_chunk_context;
     }
     global_head_arena->block_active_arena++;
-    pthread_mutex_unlock(&mmapalloc_mutex_guard);
+    MUTEX_UNLOCK(mmapalloc_mutex_guard);
     return (void *)((uintptr_t)new_chunk_context + sizeof(union ChunkContext));
 }
 
@@ -231,23 +280,34 @@ void mmapfree(void *chunk_ptr){
  */
 int mmapalloc_destroy()
 {
-    if (!global_head_arena)
-    {
-        fprintf(stderr,MMAPALLOC "invalid destroy arena\n");
+    if (!global_head_arena) {
+        fprintf(stderr, MMAPALLOC "invalid destroy arena\n");
         return EXIT_FAILURE;
     }
-    int block_free = global_head_arena->block_active_arena;
-    if (global_head_arena->magic_number_arena == MMAPALLOC_MAGIC)
-    {
-        if (global_head_arena) return munmap((void *)global_head_arena,
-            global_head_arena->size_arena + sizeof(struct ArenaContext));
-        fprintf(stderr,MMAPALLOC "failed to destroy arena\n");
-    } else
-    {
-        fprintf(stderr,MMAPALLOC "resource corrupt\n");
+
+    if (global_head_arena->magic_number_arena != MMAPALLOC_MAGIC) {
+        fprintf(stderr, MMAPALLOC "resource corrupt\n");
         return EXIT_FAILURE;
     }
-    return block_free;
+
+    int block_remaining = (int)global_head_arena->block_active_arena;
+    size_t total_size   = global_head_arena->size_arena + sizeof(struct ArenaContext);
+
+    int ret = os_free((void *)global_head_arena, total_size);
+    global_head_arena = NULL;
+    global_tail_arena = NULL;
+
+    if (mmapalloc_mutex_initialized) {
+        MUTEX_DESTROY(mmapalloc_mutex_guard);
+        mmapalloc_mutex_initialized = 0;
+    }
+
+    if (ret != 0) {
+        fprintf(stderr, MMAPALLOC "failed to destroy arena\n");
+        return EXIT_FAILURE;
+    }
+
+    return block_remaining;
 }
 
 // Hoam ngantuk
